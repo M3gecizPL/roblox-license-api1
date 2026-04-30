@@ -9,8 +9,6 @@ app = FastAPI()
 
 DB_PATH = "licenses.db"
 
-# Ten klucz będzie używany tylko przez Discord bota.
-# Ustawisz go w Render Environment Variables jako ADMIN_API_KEY.
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "dev-test-key")
 
 
@@ -22,7 +20,7 @@ class LicenseCheck(BaseModel):
     product_id: str
     creator_type: str
     creator_id: int
-    universe_id: int
+    universe_id: Optional[int] = None
     place_id: Optional[int] = None
     job_id: Optional[str] = None
 
@@ -32,12 +30,12 @@ class LicenseGrant(BaseModel):
     roblox_user_id: int
     creator_type: str
     creator_id: int
-    universe_id: int
 
 
 class LicenseRevoke(BaseModel):
     product_id: str
-    universe_id: int
+    creator_type: str
+    creator_id: int
 
 
 # =========================
@@ -63,7 +61,6 @@ def init_db():
             roblox_user_id INTEGER NOT NULL,
             creator_type TEXT NOT NULL,
             creator_id INTEGER NOT NULL,
-            universe_id INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'ACTIVE',
             created_at TEXT NOT NULL,
             revoked_at TEXT
@@ -84,6 +81,30 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    conn.commit()
+    conn.close()
+
+
+def ensure_schema():
+    """
+    Mała migracja, gdyby stara baza miała kolumnę universe_id.
+    Nie usuwamy jej fizycznie, tylko nowy kod jej nie wymaga.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(licenses)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "status" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'")
+
+    if "created_at" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN created_at TEXT")
+
+    if "revoked_at" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN revoked_at TEXT")
 
     conn.commit()
     conn.close()
@@ -128,6 +149,7 @@ def require_admin_key(x_api_key: Optional[str]):
 
 
 init_db()
+ensure_schema()
 
 
 # =========================
@@ -138,7 +160,8 @@ init_db()
 def home():
     return {
         "ok": True,
-        "message": "License API działa"
+        "message": "License API działa",
+        "mode": "creator_owner_license"
     }
 
 
@@ -154,14 +177,12 @@ def check_license(data: LicenseCheck):
         WHERE product_id = ?
           AND creator_type = ?
           AND creator_id = ?
-          AND universe_id = ?
           AND status = 'ACTIVE'
         LIMIT 1
     """, (
         data.product_id,
         data.creator_type,
-        data.creator_id,
-        data.universe_id
+        data.creator_id
     ))
 
     row = cur.fetchone()
@@ -175,11 +196,11 @@ def check_license(data: LicenseCheck):
             "reason": "LICENSE_ACTIVE"
         }
 
-    log_check(data, "BLOCK", "NO_ACTIVE_LICENSE")
+    log_check(data, "BLOCK", "NO_ACTIVE_LICENSE_FOR_CREATOR")
     return {
         "ok": True,
         "active": False,
-        "reason": "NO_ACTIVE_LICENSE"
+        "reason": "NO_ACTIVE_LICENSE_FOR_CREATOR"
     }
 
 
@@ -197,15 +218,16 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
     conn = get_conn()
     cur = conn.cursor()
 
-    # Jeśli licencja już była, aktywujemy ją ponownie.
     cur.execute("""
         SELECT id FROM licenses
         WHERE product_id = ?
-          AND universe_id = ?
+          AND creator_type = ?
+          AND creator_id = ?
         LIMIT 1
     """, (
         data.product_id,
-        data.universe_id
+        data.creator_type,
+        data.creator_id
     ))
 
     existing = cur.fetchone()
@@ -214,15 +236,11 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
         cur.execute("""
             UPDATE licenses
             SET roblox_user_id = ?,
-                creator_type = ?,
-                creator_id = ?,
                 status = 'ACTIVE',
                 revoked_at = NULL
             WHERE id = ?
         """, (
             data.roblox_user_id,
-            data.creator_type,
-            data.creator_id,
             existing[0]
         ))
     else:
@@ -232,18 +250,16 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
                 roblox_user_id,
                 creator_type,
                 creator_id,
-                universe_id,
                 status,
                 created_at,
                 revoked_at
             )
-            VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, NULL)
+            VALUES (?, ?, ?, ?, 'ACTIVE', ?, NULL)
         """, (
             data.product_id,
             data.roblox_user_id,
             data.creator_type,
             data.creator_id,
-            data.universe_id,
             now_iso()
         ))
 
@@ -261,6 +277,9 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
 def revoke_license(data: LicenseRevoke, x_api_key: Optional[str] = Header(default=None)):
     require_admin_key(x_api_key)
 
+    if data.creator_type not in ["User", "Group"]:
+        raise HTTPException(status_code=400, detail="creator_type must be User or Group")
+
     conn = get_conn()
     cur = conn.cursor()
 
@@ -269,12 +288,14 @@ def revoke_license(data: LicenseRevoke, x_api_key: Optional[str] = Header(defaul
         SET status = 'REVOKED',
             revoked_at = ?
         WHERE product_id = ?
-          AND universe_id = ?
+          AND creator_type = ?
+          AND creator_id = ?
           AND status = 'ACTIVE'
     """, (
         now_iso(),
         data.product_id,
-        data.universe_id
+        data.creator_type,
+        data.creator_id
     ))
 
     changed = cur.rowcount
@@ -308,7 +329,6 @@ def list_licenses(x_api_key: Optional[str] = Header(default=None)):
             roblox_user_id,
             creator_type,
             creator_id,
-            universe_id,
             status,
             created_at,
             revoked_at
@@ -329,10 +349,9 @@ def list_licenses(x_api_key: Optional[str] = Header(default=None)):
             "roblox_user_id": row[2],
             "creator_type": row[3],
             "creator_id": row[4],
-            "universe_id": row[5],
-            "status": row[6],
-            "created_at": row[7],
-            "revoked_at": row[8],
+            "status": row[5],
+            "created_at": row[6],
+            "revoked_at": row[7],
         })
 
     return {
