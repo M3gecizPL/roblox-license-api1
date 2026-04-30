@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 import sqlite3
@@ -7,14 +7,9 @@ import os
 
 app = FastAPI()
 
-DB_PATH = "licenses.db"
-
+DB_PATH = "licenses_v2.db"
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "dev-test-key")
 
-
-# =========================
-# MODELE
-# =========================
 
 class LicenseCheck(BaseModel):
     product_id: str
@@ -38,9 +33,9 @@ class LicenseRevoke(BaseModel):
     creator_id: int
 
 
-# =========================
-# DATABASE
-# =========================
+class LicenseRevokeById(BaseModel):
+    license_id: int
+
 
 def get_conn():
     return sqlite3.connect(DB_PATH)
@@ -48,6 +43,11 @@ def get_conn():
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def require_admin_key(x_api_key: Optional[str]):
+    if x_api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def init_db():
@@ -86,30 +86,6 @@ def init_db():
     conn.close()
 
 
-def ensure_schema():
-    """
-    Mała migracja, gdyby stara baza miała kolumnę universe_id.
-    Nie usuwamy jej fizycznie, tylko nowy kod jej nie wymaga.
-    """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("PRAGMA table_info(licenses)")
-    columns = [row[1] for row in cur.fetchall()]
-
-    if "status" not in columns:
-        cur.execute("ALTER TABLE licenses ADD COLUMN status TEXT NOT NULL DEFAULT 'ACTIVE'")
-
-    if "created_at" not in columns:
-        cur.execute("ALTER TABLE licenses ADD COLUMN created_at TEXT")
-
-    if "revoked_at" not in columns:
-        cur.execute("ALTER TABLE licenses ADD COLUMN revoked_at TEXT")
-
-    conn.commit()
-    conn.close()
-
-
 def log_check(data: LicenseCheck, result: str, reason: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -143,32 +119,20 @@ def log_check(data: LicenseCheck, result: str, reason: str):
     conn.close()
 
 
-def require_admin_key(x_api_key: Optional[str]):
-    if x_api_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-
 init_db()
-ensure_schema()
 
-
-# =========================
-# PUBLICZNE ENDPOINTY
-# =========================
 
 @app.get("/")
 def home():
     return {
         "ok": True,
         "message": "License API działa",
-        "mode": "creator_owner_license"
+        "mode": "creator_owner_license_v2"
     }
 
 
 @app.post("/license/check")
 def check_license(data: LicenseCheck):
-    print("License check:", data)
-
     conn = get_conn()
     cur = conn.cursor()
 
@@ -203,10 +167,6 @@ def check_license(data: LicenseCheck):
         "reason": "NO_ACTIVE_LICENSE_FOR_CREATOR"
     }
 
-
-# =========================
-# ADMIN ENDPOINTY DLA DISCORD BOTA
-# =========================
 
 @app.post("/admin/license/grant")
 def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=None)):
@@ -243,6 +203,7 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
             data.roblox_user_id,
             existing[0]
         ))
+        license_id = existing[0]
     else:
         cur.execute("""
             INSERT INTO licenses (
@@ -262,6 +223,7 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
             data.creator_id,
             now_iso()
         ))
+        license_id = cur.lastrowid
 
     conn.commit()
     conn.close()
@@ -269,6 +231,7 @@ def grant_license(data: LicenseGrant, x_api_key: Optional[str] = Header(default=
     return {
         "ok": True,
         "message": "LICENSE_GRANTED",
+        "license_id": license_id,
         "license": data.model_dump()
     }
 
@@ -315,8 +278,75 @@ def revoke_license(data: LicenseRevoke, x_api_key: Optional[str] = Header(defaul
     }
 
 
+@app.post("/admin/license/revoke-by-id")
+def revoke_license_by_id(data: LicenseRevokeById, x_api_key: Optional[str] = Header(default=None)):
+    require_admin_key(x_api_key)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_id,
+            roblox_user_id,
+            creator_type,
+            creator_id,
+            status
+        FROM licenses
+        WHERE id = ?
+        LIMIT 1
+    """, (
+        data.license_id,
+    ))
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return {
+            "ok": False,
+            "message": "LICENSE_NOT_FOUND"
+        }
+
+    if row[5] != "ACTIVE":
+        conn.close()
+        return {
+            "ok": False,
+            "message": "LICENSE_NOT_ACTIVE"
+        }
+
+    cur.execute("""
+        UPDATE licenses
+        SET status = 'REVOKED',
+            revoked_at = ?
+        WHERE id = ?
+    """, (
+        now_iso(),
+        data.license_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "LICENSE_REVOKED",
+        "license": {
+            "id": row[0],
+            "product_id": row[1],
+            "roblox_user_id": row[2],
+            "creator_type": row[3],
+            "creator_id": row[4]
+        }
+    }
+
+
 @app.get("/admin/license/list")
-def list_licenses(x_api_key: Optional[str] = Header(default=None)):
+def list_licenses(
+    x_api_key: Optional[str] = Header(default=None),
+    limit: int = Query(default=200, ge=1, le=1000)
+):
     require_admin_key(x_api_key)
 
     conn = get_conn()
@@ -334,8 +364,10 @@ def list_licenses(x_api_key: Optional[str] = Header(default=None)):
             revoked_at
         FROM licenses
         ORDER BY id DESC
-        LIMIT 50
-    """)
+        LIMIT ?
+    """, (
+        limit,
+    ))
 
     rows = cur.fetchall()
     conn.close()
@@ -351,7 +383,7 @@ def list_licenses(x_api_key: Optional[str] = Header(default=None)):
             "creator_id": row[4],
             "status": row[5],
             "created_at": row[6],
-            "revoked_at": row[7],
+            "revoked_at": row[7]
         })
 
     return {
